@@ -1,0 +1,135 @@
+version: '3'
+
+networks:
+  big_data_network:
+    name: big_data_network
+    external: true
+
+services:
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    ports:
+      - 9870:9870
+      - 9000:9000
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    environment:
+      - CLUSTER_NAME=test
+    env_file:
+      - ./hadoop.env
+    networks:
+      - big_data_network
+    
+  datanode1:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode1
+    depends_on:
+      - namenode
+    volumes:
+      - hadoop_datanode1:/hadoop/dfs/data
+    env_file:
+      - ./hadoop.env
+    networks:
+      - big_data_network
+
+  datanode2:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode2
+    depends_on: 
+      - namenode
+    volumes:
+      - hadoop_datanode2:/hadoop/dfs/data
+    env_file:
+      - ./hadoop.env
+    networks:
+      - big_data_network
+
+  spark-master:
+    image: bde2020/spark-master:3.0.1-hadoop3.2
+    container_name: spark-master
+    ports:
+      - 8080:8080
+      - 7077:7077
+      - 4040:4040 # added
+    environment:
+      - PYSPARK_PYTHON=python3
+    env_file:
+      - ./hadoop.env
+    volumes:
+      - ./spark:/home/batch
+      - ../stream_processing/consumer:/home/streaming/consumer
+    networks:
+      - big_data_network
+
+  spark-worker1:
+    image: bde2020/spark-worker:3.0.1-hadoop3.2
+    container_name: spark-worker1
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+    ports:
+      - 8081:8081
+    env_file:
+      - ./hadoop.env
+    networks:
+      - big_data_network
+
+  spark-worker2:
+    image: bde2020/spark-worker:3.0.1-hadoop3.2
+    container_name: spark-worker2
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MASTER=spark://spark-master:7077
+    ports:
+      - 8082:8081
+    env_file:
+      - ./hadoop.env
+    networks:
+      - big_data_network
+
+  postgresql:
+    image: postgres:14.1-alpine
+    container_name: postgresql
+    restart: on-failure:5
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: big_data
+    volumes:
+      - postgresdb_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - big_data_network
+
+  metabase-app:
+    image: metabase/metabase
+    container_name: metabase-app
+    restart: on-failure:10
+    ports:
+      - 3000:3000
+    environment:
+      - MB_DB_TYPE=postgres
+      - MB_DB_DBNAME=big_data
+      - MB_DB_PORT=5432
+      - MB_DB_USER=postgres
+      - MB_DB_PASS=postgres
+      - MB_DB_HOST=postgresql
+    volumes:
+      - metabase:/metabase-data
+    depends_on:
+      - postgresql
+    links:
+      - postgresql
+    networks:
+      - big_data_network
+
+volumes:
+  hadoop_namenode:
+  hadoop_datanode1:
+  hadoop_datanode2:
+  postgresdb_data:
+  metabase:
