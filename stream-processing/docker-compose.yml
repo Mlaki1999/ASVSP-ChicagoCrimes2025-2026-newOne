@@ -1,0 +1,80 @@
+version: '3'
+
+networks:
+  big_data_network:
+    name: big_data_network
+    external: true
+
+services:
+  zoo1:
+    image: zookeeper:3.4.9
+    container_name: zoo1
+    ports:
+      - "2181:2181"
+    environment:
+        ZOO_MY_ID: 1
+        ZOO_PORT: 2181
+        ZOO_SERVERS: server.1=zoo1:2888:3888
+    volumes:
+      - zoo1:/data
+      - zoo1log:/datalog
+    networks:
+      - big_data_network
+
+  kafka1:
+    image: confluentinc/cp-kafka:5.3.1
+    container_name: kafka1
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka1:19092,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP:-127.0.0.1}:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: "zoo1:2181"
+      KAFKA_BROKER_ID: 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
+    volumes:
+      - kafka1:/var/lib/kafka/data
+    depends_on:
+      - zoo1
+    networks:
+      - big_data_network
+
+  kafka2:
+    image: confluentinc/cp-kafka:5.3.1
+    container_name: kafka2
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka2:19092,LISTENER_DOCKER_EXTERNAL://${DOCKER_HOST_IP:-127.0.0.1}:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
+      KAFKA_ZOOKEEPER_CONNECT: "zoo1:2181"
+      KAFKA_BROKER_ID: 2
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
+    volumes:
+      - kafka2:/var/lib/kafka/data
+    depends_on:
+      - zoo1
+    networks:
+      - big_data_network
+
+  producer:
+    build: ./producer
+    container_name: kafka_producer
+    environment:
+      KAFKA_BROKERS: "kafka1:19092,kafka2:19092"
+      HDFS_NAMENODE: "http://namenode:9870"
+    depends_on:
+      - kafka1
+      - kafka2
+    networks:
+      - big_data_network
+
+volumes:
+  zoo1:
+  zoo1log:
+  kafka1:
+  kafka2:
