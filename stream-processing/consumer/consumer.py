@@ -1,10 +1,44 @@
 import json
+import time
+import uuid
+import shutil
+import os
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
 from pyspark.sql.window import Window
 
 TOPIC = "chicagocrimes"
+
+# Generate unique session ID to prevent conflicts
+SESSION_ID = str(uuid.uuid4())[:8]
+print(f"🔧 Starting streaming session: {SESSION_ID}")
+
+# Cleanup function for checkpoints
+def cleanup_checkpoints():
+    """Clean up old checkpoint directories"""
+    checkpoint_dirs = [
+        "/tmp/checkpoint",
+        "/tmp/checkpoint_console", 
+        "/tmp/checkpoint_hotspots",
+        "/tmp/checkpoint_violence",
+        "/tmp/checkpoint_domestic", 
+        "/tmp/checkpoint_patterns",
+        "/tmp/checkpoint_temporal"
+    ]
+    
+    for dir_path in checkpoint_dirs:
+        try:
+            if os.path.exists(dir_path):
+                shutil.rmtree(dir_path)
+                print(f"🧹 Cleaned checkpoint: {dir_path}")
+        except Exception as e:
+            print(f"⚠️ Could not clean {dir_path}: {e}")
+
+# Clean up before starting
+print("🧹 Cleaning up old checkpoints...")
+cleanup_checkpoints()
+time.sleep(2)
 
 def quiet_logs(sc):
     logger = sc._jvm.org.apache.log4j
@@ -13,8 +47,8 @@ def quiet_logs(sc):
 
 spark = SparkSession \
     .builder \
-    .appName("ChicagoCrimesAdvancedStreaming") \
-    .config("spark.sql.streaming.checkpointLocation", "/tmp/checkpoint") \
+    .appName(f"ChicagoCrimesStreaming_{SESSION_ID}") \
+    .config("spark.sql.streaming.checkpointLocation", f"/tmp/checkpoint_{SESSION_ID}") \
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
     .config("spark.driver.extraClassPath", "/opt/bitnami/spark/jars/postgresql-42.7.0.jar") \
     .config("spark.executor.extraClassPath", "/opt/bitnami/spark/jars/postgresql-42.7.0.jar") \
@@ -389,59 +423,63 @@ temporal_patterns = df_crimes_enriched \
 # ===============================================================================================================
 
 print("\n💾 Starting streaming queries with optimized resource management...")
+print(f"🔧 Session ID: {SESSION_ID}")
 
-# Start with most critical transformations first
+# Start queries with delays to prevent conflicts
 print("\n🔥 Starting Crime Hotspots (Most Critical)...")
 query1 = write_to_postgres_streaming(
     crime_hotspots, 
     "stream_crime_hotspots",
-    "/tmp/checkpoint_hotspots"
+    f"/tmp/checkpoint_hotspots_{SESSION_ID}"
 )
+time.sleep(3)  # Delay to prevent conflicts
 
 # Console output for immediate monitoring
 console_query1 = crime_hotspots.writeStream \
     .outputMode("append") \
     .format("console") \
     .option("truncate", False) \
-    .option("checkpointLocation", "/tmp/checkpoint_console") \
+    .option("checkpointLocation", f"/tmp/checkpoint_console_{SESSION_ID}") \
     .trigger(processingTime='45 seconds') \
     .start()
 
 print("✅ Crime Hotspots stream started successfully!")
+time.sleep(2)
 
 print("\n⚡ Starting Violence Escalation Detection...")
 query3 = write_to_postgres_streaming(
     violence_escalation,
     "stream_violence_escalation",
-    "/tmp/checkpoint_violence"
+    f"/tmp/checkpoint_violence_{SESSION_ID}"
 )
-
+time.sleep(3)  # Prevent conflicts
 print("✅ Violence Escalation stream started successfully!")
 
 print("\n🏠 Starting Domestic Violence Correlation...")
 query4 = write_to_postgres_streaming(
     domestic_correlation,
     "stream_domestic_correlation", 
-    "/tmp/checkpoint_domestic"
+    f"/tmp/checkpoint_domestic_{SESSION_ID}"
 )
-
+time.sleep(3)  # Prevent conflicts
 print("✅ Domestic Correlation stream started successfully!")
 
 print("\n🧠 Starting Pattern Analysis...")  
 query2 = write_to_postgres_streaming(
     stream_pattern_analysis,
     "stream_pattern_analysis", 
-    "/tmp/checkpoint_patterns"
+    f"/tmp/checkpoint_patterns_{SESSION_ID}"
 )
-
+time.sleep(3)  # Prevent conflicts
 print("✅ Pattern Analysis stream started successfully!")
 
 print("\n⏰ Starting Temporal Patterns...")
 query5 = write_to_postgres_streaming(
     temporal_patterns,
     "stream_temporal_patterns",
-    "/tmp/checkpoint_temporal"
+    f"/tmp/checkpoint_temporal_{SESSION_ID}"
 )
+time.sleep(2)
 
 print("✅ All streams started successfully!")
 

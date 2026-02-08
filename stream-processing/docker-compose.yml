@@ -85,6 +85,25 @@ services:
     networks:
       - big_data_network
 
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: chicago-crimes-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:19092,kafka2:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zoo1:2181
+      KAFKA_CLUSTERS_0_READONLY: false
+      DYNAMIC_CONFIG_ENABLED: true
+      LOGGING_LEVEL_ORG_APACHE_KAFKA: INFO
+    depends_on:
+      - kafka1
+      - kafka2
+      - zoo1
+    networks:
+      - big_data_network
+
 volumes:
   zoo1:
   zoo1log:
