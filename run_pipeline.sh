@@ -18,7 +18,7 @@ sleep 30
 # Step 3: Run batch processing
 echo ""
 echo "Step 3: Running batch processing jobs..."
-cd ../batch-processing/run
+cd ../batch_processing/run
 chmod +x batch_jobs_run.sh
 ./batch_jobs_run.sh
 
