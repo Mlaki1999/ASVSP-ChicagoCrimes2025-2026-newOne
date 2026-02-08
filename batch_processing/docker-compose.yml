@@ -58,7 +58,7 @@ services:
       - ./hadoop.env
     volumes:
       - ./spark:/home/batch
-      - ../stream_processing/consumer:/home/streaming/consumer
+      - ../stream-processing/consumer:/home/streaming/consumer
     networks:
       - big_data_network
 
