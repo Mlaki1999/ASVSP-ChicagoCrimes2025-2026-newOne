@@ -3,8 +3,8 @@ echo "==============================="
 
 echo ""
 echo "Step 1: Complete cleanup of conflicting containers..."
-docker stop zoo1 kafka1 kafka2 kafka_producer 2>/dev/null || true
-docker rm zoo1 kafka1 kafka2 kafka_producer 2>/dev/null || true
+docker stop zoo1 kafka1 kafka2 kafka_producer mongodb mongo-express kafka-ui 2>/dev/null || true
+docker rm zoo1 kafka1 kafka2 kafka_producer mongodb mongo-express kafka-ui 2>/dev/null || true
 
 echo "Cleanup complete"
 
@@ -54,7 +54,7 @@ for i in {1..4}; do
     # Test both brokers with correct internal ports
     if docker exec kafka1 kafka-topics --list --bootstrap-server kafka1:19092 2>/dev/null && \
        docker exec kafka2 kafka-topics --list --bootstrap-server kafka2:29092 2>/dev/null; then
-        echo "✅ Both Kafka brokers are ready"
+        echo " Both Kafka brokers are ready"
         KAFKA_READY=true
         break
     else
@@ -75,13 +75,13 @@ for i in {1..4}; do
 done
 
 if [ "$KAFKA_READY" = false ]; then
-    echo "❌ Kafka failed to start properly. Checking logs..."
+    echo " Kafka failed to start properly. Checking logs..."
     echo ""
     echo "=== Checking Zookeeper Status ==="
     if docker exec zoo1 nc -zv zoo1 2181 2>/dev/null; then
-        echo "✅ Zookeeper is responding"
+        echo " Zookeeper is responding"
     else
-        echo "❌ Zookeeper is not responding - this may be the root cause"
+        echo " Zookeeper is not responding - this may be the root cause"
     fi
     echo ""
     echo "=== Kafka1 logs ==="
@@ -108,17 +108,17 @@ echo "Step 9: Verify topic creation..."
 TOPIC_CREATED=false
 for i in {1..10}; do
     if docker exec kafka1 kafka-topics --describe --topic chicagocrimes --bootstrap-server kafka1:19092,kafka2:29092 2>/dev/null; then
-        echo "✅ Topic 'chicagocrimes' created and accessible"
+        echo " Topic 'chicagocrimes' created and accessible"
         TOPIC_CREATED=true
         break
     else
-        echo "⏳ Waiting for topic creation (attempt $i/10)..."
+        echo " Waiting for topic creation (attempt $i/10)..."
         sleep 3
     fi
 done
 
 if [ "$TOPIC_CREATED" = false ]; then
-    echo "❌ Failed to create or access topic"
+    echo " Failed to create or access topic"
     exit 1
 fi
 
@@ -184,7 +184,7 @@ echo "Step 16: Final connectivity test..."
 CONNECTIVITY_OK=false
 for i in {1..5}; do
     if docker exec spark-master nc -zv kafka1 19092 2>/dev/null && docker exec spark-master nc -zv kafka2 29092 2>/dev/null; then
-        echo "✅ Connectivity verified - Ready to start stream processing"
+        echo " Connectivity verified - Ready to start stream processing"
         CONNECTIVITY_OK=true
         break
     else
@@ -206,12 +206,26 @@ done
 
 if [ "$CONNECTIVITY_OK" = true ]; then
     echo ""
-    echo "🚀 Starting stream processing..."
-    docker exec -i spark-master bash ./stream_jobs.sh
-else
-    echo "❌ Connectivity issues persist. Manual troubleshooting needed."
+    echo " STREAMING PIPELINE READY!"
+    echo " Access Points:"
+    echo "  • Kafka UI:     http://localhost:8090"
+    echo "  • Mongo Express: http://localhost:8083 (admin/admin123)" 
+    echo "  • MongoDB:      mongodb://root:mongodb123@localhost:27017/chicago_crimes"
     echo ""
-    echo "🐛 Debug information:"
+    echo " To monitor:"
+    echo "  docker logs kafka_producer -f   # Producer logs"
+    echo "  docker logs mongodb -f          # MongoDB logs"
+    echo ""
+    echo " Data will be stored in MongoDB collections:"
+    echo "  • stream_crime_hotspots"
+    echo "  • stream_pattern_analysis" 
+    echo "  • stream_violence_escalation"
+    echo "  • stream_domestic_correlation"
+    echo "  • stream_temporal_patterns"
+else
+    echo " Connectivity issues persist. Manual troubleshooting needed."
+    echo ""
+    echo " Debug information:"
     echo "=== Spark Master Network ==="
     docker exec spark-master ip route
     echo "=== Kafka1 Status ==="

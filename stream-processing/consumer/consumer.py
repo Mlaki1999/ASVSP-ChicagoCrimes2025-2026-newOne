@@ -3,10 +3,13 @@ import time
 import uuid
 import shutil
 import os
+import pandas as pd
+from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
 from pyspark.sql.window import Window
+from pymongo import MongoClient
 
 TOPIC = "chicagocrimes"
 
@@ -50,46 +53,71 @@ spark = SparkSession \
     .appName(f"ChicagoCrimesStreaming_{SESSION_ID}") \
     .config("spark.sql.streaming.checkpointLocation", f"/tmp/checkpoint_{SESSION_ID}") \
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
-    .config("spark.driver.extraClassPath", "/opt/bitnami/spark/jars/postgresql-42.7.0.jar") \
-    .config("spark.executor.extraClassPath", "/opt/bitnami/spark/jars/postgresql-42.7.0.jar") \
     .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
     .config("spark.sql.adaptive.enabled", "true") \
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
     .config("spark.streaming.stopGracefullyOnShutdown", "true") \
     .getOrCreate()
 
 quiet_logs(spark)
 
-# PostgreSQL Configuration
-POSTGRESQL_URL = "jdbc:postgresql://postgresql:5432/big_data"
-POSTGRESQL_USER = "postgres"
-POSTGRESQL_PASSWORD = "postgres"
-POSTGRESQL_DRIVER = "org.postgresql.Driver"
+# MongoDB Configuration
+MONGODB_HOST = "mongodb"  
+MONGODB_PORT = 27017
+MONGODB_USERNAME = "root"
+MONGODB_PASSWORD = "mongodb123"
+MONGODB_DATABASE = "chicago_crimes"
+MONGODB_URI = f"mongodb://{MONGODB_USERNAME}:{MONGODB_PASSWORD}@{MONGODB_HOST}:{MONGODB_PORT}/{MONGODB_DATABASE}?authSource=admin"
 
-# Helper function to write to PostgreSQL
-def write_to_postgres_batch(df, table_name):
-    """Write DataFrame to PostgreSQL using JDBC"""
+# Initialize MongoDB client
+mongo_client = None
+while not mongo_client:
     try:
-        df.write \
-            .format("jdbc") \
-            .option("url", POSTGRESQL_URL) \
-            .option("dbtable", table_name) \
-            .option("user", POSTGRESQL_USER) \
-            .option("password", POSTGRESQL_PASSWORD) \
-            .option("driver", POSTGRESQL_DRIVER) \
-            .mode("append") \
-            .save()
-        print(f"✓ Successfully saved batch to {table_name}")
+        mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        # Test connection
+        mongo_client.server_info()
+        print(" Connected to MongoDB!")
+        break
     except Exception as e:
-        print(f"✗ Error saving to {table_name}: {str(e)}")
+        print(f" Connecting to MongoDB: {e}... retrying in 3s")
+        time.sleep(3)
 
-def write_to_postgres_streaming(df, table_name, checkpoint_location):
-    """Write streaming DataFrame to PostgreSQL using foreachBatch"""
+db = mongo_client[MONGODB_DATABASE]
+
+# Helper function to write to MongoDB
+def write_to_mongodb_batch(df, collection_name):
+    """Write DataFrame to MongoDB collection"""
+    try:
+        if df.count() > 0:
+            # Convert DataFrame to list of dictionaries
+            records = df.toPandas().to_dict('records')
+            
+            # Convert timestamps and handle NaN values
+            for record in records:
+                for key, value in record.items():
+                    if pd.isna(value):
+                        record[key] = None
+                    elif isinstance(value, pd.Timestamp):
+                        record[key] = value.to_pydatetime()
+            
+            # Add metadata
+            for record in records:
+                record['_inserted_at'] = datetime.now()
+                record['_session_id'] = SESSION_ID
+            
+            # Insert into MongoDB
+            collection = db[collection_name]
+            result = collection.insert_many(records)
+            print(f"✓ Successfully saved {len(result.inserted_ids)} records to {collection_name}")
+    except Exception as e:
+        print(f"✗ Error saving to {collection_name}: {str(e)}")
+
+def write_to_mongodb_streaming(df, collection_name, checkpoint_location):
+    """Write streaming DataFrame to MongoDB using foreachBatch"""
     def write_batch(batch_df, batch_id):
-        print(f"📝 Writing batch {batch_id} to {table_name} ({batch_df.count()} records)")
+        print(f"📝 Writing batch {batch_id} to {collection_name} ({batch_df.count()} records)")
         if batch_df.count() > 0:
-            write_to_postgres_batch(batch_df, table_name)
+            write_to_mongodb_batch(batch_df, collection_name)
     
     return df.writeStream \
         .foreachBatch(write_batch) \
@@ -166,7 +194,7 @@ print("=" * 80)
 # TRANSFORMATION 1: REAL-TIME CRIME HOTSPOT DETECTION WITH WINDOWING
 # ===============================================================================================================
 
-print("\n🔥 TRANSFORMATION 1: Real-time Crime Hotspot Detection")
+print("\n TRANSFORMATION 1: Real-time Crime Hotspot Detection")
 crime_hotspots = df_crimes_enriched \
     .filter(col("latitude").isNotNull() & col("longitude").isNotNull()) \
     .withColumn("geo_grid", concat(
@@ -203,7 +231,7 @@ crime_hotspots = df_crimes_enriched \
 # TRANSFORMATION 2: STREAM-TO-BATCH JOIN - HISTORICAL CRIME PATTERN MATCHING
 # ===============================================================================================================
 
-print("\n📊 TRANSFORMATION 2: Stream-to-Batch Join - Historical Pattern Matching")
+print("\n TRANSFORMATION 2: Stream-to-Batch Join - Historical Pattern Matching")
 
 # Create batch reference data (this would typically come from your batch processing results)
 batch_crime_patterns = spark.sql("""
@@ -261,7 +289,7 @@ stream_pattern_analysis = df_crimes_enriched \
 # TRANSFORMATION 3: COMPLEX WINDOWED AGGREGATION - VIOLENCE ESCALATION DETECTION
 # ===============================================================================================================
 
-print("\n⚡ TRANSFORMATION 3: Violence Escalation Detection with Complex Windowing")
+print("\n TRANSFORMATION 3: Violence Escalation Detection with Complex Windowing")
 
 violence_escalation = df_crimes_enriched \
     .filter(col("is_violent") == True) \
@@ -304,7 +332,7 @@ violence_escalation = df_crimes_enriched \
 # TRANSFORMATION 4: STREAM-TO-STREAM JOIN - DOMESTIC VIOLENCE CORRELATION ANALYSIS
 # ===============================================================================================================
 
-print("\n🏠 TRANSFORMATION 4: Stream-to-Stream Join - Domestic Violence Correlation")
+print("\n TRANSFORMATION 4: Stream-to-Stream Join - Domestic Violence Correlation")
 
 # Create two streams from the same source for self-join
 domestic_crimes = df_crimes_enriched \
@@ -426,8 +454,8 @@ print("\n💾 Starting streaming queries with optimized resource management...")
 print(f"🔧 Session ID: {SESSION_ID}")
 
 # Start queries with delays to prevent conflicts
-print("\n🔥 Starting Crime Hotspots (Most Critical)...")
-query1 = write_to_postgres_streaming(
+print("\n Starting Crime Hotspots (Most Critical)...")
+query1 = write_to_mongodb_streaming(
     crime_hotspots, 
     "stream_crime_hotspots",
     f"/tmp/checkpoint_hotspots_{SESSION_ID}"
@@ -447,57 +475,57 @@ print("✅ Crime Hotspots stream started successfully!")
 time.sleep(2)
 
 print("\n⚡ Starting Violence Escalation Detection...")
-query3 = write_to_postgres_streaming(
+query3 = write_to_mongodb_streaming(
     violence_escalation,
     "stream_violence_escalation",
     f"/tmp/checkpoint_violence_{SESSION_ID}"
 )
 time.sleep(3)  # Prevent conflicts
-print("✅ Violence Escalation stream started successfully!")
+print(" Violence Escalation stream started successfully!")
 
 print("\n🏠 Starting Domestic Violence Correlation...")
-query4 = write_to_postgres_streaming(
+query4 = write_to_mongodb_streaming(
     domestic_correlation,
     "stream_domestic_correlation", 
     f"/tmp/checkpoint_domestic_{SESSION_ID}"
 )
 time.sleep(3)  # Prevent conflicts
-print("✅ Domestic Correlation stream started successfully!")
+print(" Domestic Correlation stream started successfully!")
 
-print("\n🧠 Starting Pattern Analysis...")  
-query2 = write_to_postgres_streaming(
+print("\n Starting Pattern Analysis...")  
+query2 = write_to_mongodb_streaming(
     stream_pattern_analysis,
     "stream_pattern_analysis", 
     f"/tmp/checkpoint_patterns_{SESSION_ID}"
 )
 time.sleep(3)  # Prevent conflicts
-print("✅ Pattern Analysis stream started successfully!")
+print(" Pattern Analysis stream started successfully!")
 
-print("\n⏰ Starting Temporal Patterns...")
-query5 = write_to_postgres_streaming(
+print("\n Starting Temporal Patterns...")
+query5 = write_to_mongodb_streaming(
     temporal_patterns,
     "stream_temporal_patterns",
     f"/tmp/checkpoint_temporal_{SESSION_ID}"
 )
 time.sleep(2)
 
-print("✅ All streams started successfully!")
+print(" All streams started successfully!")
 
-print("\n🚀 All 5 Advanced Stream Processing Transformations are running!")
-print("📊 Data is being persisted to PostgreSQL tables:")
+print("\n All 5 Advanced Stream Processing Transformations are running!")
+print(" Data is being persisted to MongoDB collections:")
 print("   • stream_crime_hotspots - Real-time hotspot detection")
 print("   • stream_pattern_analysis - Historical pattern matching") 
 print("   • stream_violence_escalation - Violence escalation monitoring")
 print("   • stream_domestic_correlation - Domestic violence correlations")
 print("   • stream_temporal_patterns - Advanced temporal analysis")
-print("\n🔄 Monitoring console outputs...")
+print("\n Monitoring console outputs...")
 
 # Graceful termination handling
 import signal
 import sys
 
 def signal_handler(sig, frame):
-    print('\n🛑 Gracefully stopping all streams...')
+    print('\n Gracefully stopping all streams...')
     try:
         query1.stop()
         query2.stop()  
