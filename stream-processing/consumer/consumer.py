@@ -51,12 +51,15 @@ def quiet_logs(sc):
 spark = SparkSession \
     .builder \
     .appName(f"ChicagoCrimesStreaming_{SESSION_ID}") \
+    .master("spark://spark-master:7077") \
     .config("spark.sql.streaming.checkpointLocation", f"/tmp/checkpoint_{SESSION_ID}") \
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
     .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
     .config("spark.sql.adaptive.enabled", "true") \
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
     .config("spark.streaming.stopGracefullyOnShutdown", "true") \
+    .config("spark.driver.host", "stream_consumer") \
+    .config("spark.driver.port", "7001") \
     .getOrCreate()
 
 quiet_logs(spark)
@@ -139,7 +142,7 @@ parse_udf = udf(lambda s: parse_json_safe(s), MapType(StringType(), StringType()
 # Čitanje iz Kafka sa timestamp informacijama .option("kafka.enable.auto.commit", "true") \
 df_stream = spark.readStream \
     .format("kafka") \
-    .option("kafka.bootstrap.servers", "kafka1:19092,kafka2:19092") \
+    .option("kafka.bootstrap.servers", "kafka1:19092,kafka2:29092") \
     .option("subscribe", TOPIC) \
     .option("startingOffsets", "latest") \
     .option("failOnDataLoss", "false") \
@@ -471,7 +474,7 @@ console_query1 = crime_hotspots.writeStream \
     .trigger(processingTime='45 seconds') \
     .start()
 
-print("✅ Crime Hotspots stream started successfully!")
+print(" Crime Hotspots stream started successfully!")
 time.sleep(2)
 
 print("\n⚡ Starting Violence Escalation Detection...")

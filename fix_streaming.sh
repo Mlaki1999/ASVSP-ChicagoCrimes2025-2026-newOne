@@ -101,7 +101,7 @@ echo "Deleting existing topic (if exists)..."
 docker exec kafka1 kafka-topics --delete --topic chicagocrimes --bootstrap-server kafka1:19092 2>/dev/null || echo "Topic didn't exist or couldn't be deleted"
 sleep 5
 echo "Creating fresh Kafka topic..."
-docker exec kafka1 kafka-topics --create --topic chicagocrimes --bootstrap-server kafka1:19092,kafka2:29092 --partitions 3 --replication-factor 2 --if-not-exists --config cleanup.policy=delete --config retention.ms=86400000 --config segment.ms=3600000
+docker exec kafka1 kafka-topics --create --topic chicagocrimes --bootstrap-server kafka1:19092,kafka2:29092 --partitions 3 --replication-factor 1 --if-not-exists --config cleanup.policy=delete --config retention.ms=86400000 --config segment.ms=3600000
 
 echo ""
 echo "Step 9: Verify topic creation..."
@@ -124,99 +124,126 @@ fi
 
 echo ""
 echo "Step 10: Stop any running streaming jobs and clean checkpoints..."
-echo "Stopping Spark streaming applications..."
-docker exec spark-master bash -c 'ps aux | grep "consumer.py\|stream_jobs" | grep -v grep | awk "{print \$2}" | xargs -r kill -9' 2>/dev/null || true
-sleep 10
-echo "Cleaning all checkpoint locations..."
-docker exec spark-master rm -rf /tmp/checkpoint* 2>/dev/null || true
-docker exec spark-master rm -rf /tmp/spark-streaming-* 2>/dev/null || true  
-docker exec spark-master rm -rf /opt/bitnami/spark/work-dir/checkpoint* 2>/dev/null || true
-echo "Streaming processes stopped and all checkpoints cleaned"
+echo "Stopping any conflicting containers..."
+docker stop stream_consumer 2>/dev/null || true
+docker rm stream_consumer 2>/dev/null || true
+echo "Streaming processes stopped"
 
 echo ""
-echo "Step 11: Setup stream processing files..."
-docker exec spark-master mkdir -p /home/streaming/consumer
-docker cp ./consumer/consumer.py spark-master:/home/streaming/consumer/consumer.py
-docker cp ./run/stream_jobs.sh spark-master:./stream_jobs.sh
-
-# echo ""
-# echo "Step 12: Copy connectivity test script..."
-# docker cp ./test_kafka_connectivity.py spark-master:/home/test_kafka_connectivity.py
-
-# echo ""
-# echo "Step 13: Run comprehensive Kafka connectivity test..."
-# echo "Running Kafka functionality test..."
-# if docker exec spark-master python3 /home/test_kafka_connectivity.py; then
-#     echo "✅ Kafka connectivity test passed - system is ready"
-# else
-#     echo "❌ Kafka connectivity test failed"
-#     echo "🔍 Checking Kafka broker status..."
-#     docker exec kafka1 kafka-broker-api-versions --bootstrap-server localhost:9092 2>/dev/null || echo "Kafka1 not responding to API requests"
-#     docker exec kafka2 kafka-broker-api-versions --bootstrap-server localhost:9092 2>/dev/null || echo "Kafka2 not responding to API requests"
-#     exit 1
-# fi
-
 echo ""
-echo "Step 14: Setup PostgreSQL JDBC driver..."
-# Check if PostgreSQL jar exists in the batch processing setup
-if docker exec spark-master ls postgresql-42.7.0.jar 2>/dev/null; then
-    echo "PostgreSQL driver already exists in Spark master"
+echo "Step 11: Start streaming consumer..."
+echo "Starting the stream consumer service..."
+docker-compose up -d consumer
+sleep 30
+
+echo "Verifying consumer startup..."
+if docker ps | grep -q "stream_consumer"; then
+    echo " Stream consumer started successfully"
 else
-    echo "PostgreSQL driver not found. Copying from setup..."
-    # Try to copy from the project directory or download
-    if [ -f "../setup/postgresql-42.7.0.jar" ]; then
-        docker cp ../setup/postgresql-42.7.0.jar spark-master:/opt/bitnami/spark/jars/postgresql-42.7.0.jar
-        echo "PostgreSQL driver copied to Spark master"
-    else
-        echo "⬇Downloading PostgreSQL JDBC driver..."
-        docker exec spark-master wget -O /opt/bitnami/spark/jars/postgresql-42.7.0.jar https://jdbc.postgresql.org/download/postgresql-42.7.0.jar
-        echo "PostgreSQL driver downloaded to Spark master"
-    fi
+    echo " Stream consumer failed to start"
+    docker logs stream_consumer --tail 20
+    exit 1
+fi
+
+echo "Step 12: Monitor consumer startup..."
+echo "Checking consumer logs for MongoDB connection..."
+sleep 15
+echo "Recent consumer logs:"
+docker logs stream_consumer --tail 50
+
+echo ""
+echo "Step 13: Check MongoDB connectivity..."
+echo "Testing MongoDB connection from consumer..."
+sleep 5
+if docker exec mongodb mongosh -u root -p mongodb123 --eval "db.adminCommand('ismaster')" > /dev/null 2>&1; then
+    echo " MongoDB is accessible"
+else
+    echo " MongoDB connection failed"
+    docker logs mongodb --tail 20
+    exit 1
 fi
 
 echo ""
-echo "Step 15: Final verification..."
+echo "Step 14: Final verification..."
 echo "Checking topic details one more time:"
 docker exec kafka1 kafka-topics --describe --topic chicagocrimes --bootstrap-server kafka1:19092,kafka2:29092 || echo "⚠️  Topic description failed (may be normal due to timeouts)"
 
 echo ""
-echo "Step 16: Final connectivity test..."
-CONNECTIVITY_OK=false
-for i in {1..5}; do
-    if docker exec spark-master nc -zv kafka1 19092 2>/dev/null && docker exec spark-master nc -zv kafka2 29092 2>/dev/null; then
-        echo " Connectivity verified - Ready to start stream processing"
+echo "Step 15: Final connectivity test..."
+echo "Waiting for consumer to fully initialize (installing dependencies)..."
+sleep 30
+
+echo "Checking if consumer application has started..."
+for i in {1..10}; do
+    echo "Checking consumer startup progress (attempt $i/10)..."
+    
+    # Check if the consumer logs show successful startup
+    if docker logs stream_consumer 2>&1 | grep -q "Connected to MongoDB\|Starting streaming session\|Started successfully"; then
+        echo " Consumer application started successfully"
         CONNECTIVITY_OK=true
         break
+    elif docker logs stream_consumer 2>&1 | grep -q "Error\|Failed\|Exception"; then
+        echo " Consumer application encountered errors"
+        echo "Recent consumer logs:"
+        docker logs stream_consumer --tail 20
+        CONNECTIVITY_OK=false
+        break
     else
-        echo "⏳ Testing connectivity (attempt $i/5)..."
-        # Test individual brokers
-        if docker exec spark-master nc -zv kafka1 19092 2>/dev/null; then
-            echo "  ✓ kafka1:19092 reachable"
-        else
-            echo "  ✗ kafka1:19092 not reachable"
-        fi
-        if docker exec spark-master nc -zv kafka2 29092 2>/dev/null; then
-            echo "  ✓ kafka2:29092 reachable"
-        else
-            echo "  ✗ kafka2:29092 not reachable"
-        fi
-        sleep 5
+        echo " Consumer still initializing... (downloading dependencies)"
+        sleep 15
     fi
 done
+
+# If we didn't get a clear success/failure, check if it's still installing
+if [ -z "$CONNECTIVITY_OK" ]; then
+    echo "Consumer is still starting up. Checking if it can reach services..."
+    
+    # Test using Python instead of nc
+    SERVICES_OK=false
+    if docker exec stream_consumer python3 -c "
+import socket
+def test_port(host, port):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except:
+        return False
+
+kafka_ok = test_port('kafka1', 19092) and test_port('kafka2', 29092)
+mongo_ok = test_port('mongodb', 27017) 
+spark_ok = test_port('spark-master', 7077)
+
+print(f'Kafka: {kafka_ok}, MongoDB: {mongo_ok}, Spark: {spark_ok}')
+if kafka_ok and mongo_ok and spark_ok:
+    exit(0)
+else:
+    exit(1)
+" 2>/dev/null; then
+        echo " All services are reachable from consumer"
+        CONNECTIVITY_OK=true
+    else
+        echo " Some services not reachable from consumer"
+        CONNECTIVITY_OK=false
+    fi
+fi
 
 if [ "$CONNECTIVITY_OK" = true ]; then
     echo ""
     echo " STREAMING PIPELINE READY!"
     echo " Access Points:"
-    echo "  • Kafka UI:     http://localhost:8090"
+    echo "  • Kafka UI:     http://localhost:8091"
     echo "  • Mongo Express: http://localhost:8083 (admin/admin123)" 
-    echo "  • MongoDB:      mongodb://root:mongodb123@localhost:27017/chicago_crimes"
+    echo "  • MongoDB:      mongodb://root:mongodb123@localhost:27018/chicago_crimes"
     echo ""
-    echo " To monitor:"
-    echo "  docker logs kafka_producer -f   # Producer logs"
-    echo "  docker logs mongodb -f          # MongoDB logs"
+    echo "🔍 To monitor:"
+    echo "  docker logs kafka_producer -f      # Producer logs"
+    echo "  docker logs stream_consumer -f     # Consumer logs"
+    echo "  docker logs mongodb -f             # MongoDB logs"
     echo ""
-    echo " Data will be stored in MongoDB collections:"
+    echo "💾 Data will be stored in MongoDB collections:"
     echo "  • stream_crime_hotspots"
     echo "  • stream_pattern_analysis" 
     echo "  • stream_violence_escalation"
@@ -226,13 +253,15 @@ else
     echo " Connectivity issues persist. Manual troubleshooting needed."
     echo ""
     echo " Debug information:"
-    echo "=== Spark Master Network ==="
-    docker exec spark-master ip route
+    echo "=== Consumer Container Network ==="
+    docker exec stream_consumer ip route 2>/dev/null || echo "Cannot access consumer network info"
+    echo "=== Consumer Logs (recent) ==="
+    docker logs stream_consumer --tail 30
     echo "=== Kafka1 Status ==="
-    docker exec kafka1 netstat -tlnp | grep 19092
-    echo "=== Kafka1 Recent Logs ==="
-    docker logs kafka1 --tail 20
-    echo "=== Kafka2 Recent Logs ==="
-    docker logs kafka2 --tail 20
+    docker exec kafka1 netstat -tlnp | grep 19092 2>/dev/null || echo "Cannot access kafka1 network info"
+    echo "=== MongoDB Status ==="
+    docker exec mongodb netstat -tlnp | grep 27017 2>/dev/null || echo "Cannot access mongodb network info"
+    echo "=== All Container Status ==="
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
     exit 1
 fi

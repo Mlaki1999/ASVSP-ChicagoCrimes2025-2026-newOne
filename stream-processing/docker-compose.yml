@@ -1,5 +1,3 @@
-version: '3'
-
 networks:
   big_data_network:
     name: big_data_network
@@ -89,11 +87,29 @@ services:
     networks:
       - big_data_network
 
+  consumer:
+    build: ./consumer
+    container_name: stream_consumer
+    volumes:
+      - ./consumer:/opt/consumer
+    environment:
+      # SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_DRIVER_HOST: stream_consumer
+      SPARK_DRIVER_PORT: 7001
+      SPARK_UI_PORT: 4041
+    depends_on:
+      - kafka1
+      - kafka2
+      - mongodb
+      - producer
+    networks:
+      - big_data_network
+
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
     ports:
-      - "8090:8080"
+      - "8091:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: chicago-crimes-cluster
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:19092,kafka2:29092
@@ -112,7 +128,7 @@ services:
     image: mongo:5.0
     container_name: mongodb
     ports:
-      - "27017:27017"
+      - "27018:27017"
     environment:
       MONGO_INITDB_ROOT_USERNAME: root
       MONGO_INITDB_ROOT_PASSWORD: mongodb123

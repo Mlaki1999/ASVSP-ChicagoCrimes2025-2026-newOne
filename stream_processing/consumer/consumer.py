@@ -51,12 +51,15 @@ def quiet_logs(sc):
 spark = SparkSession \
     .builder \
     .appName(f"ChicagoCrimesStreaming_{SESSION_ID}") \
+    .master("spark://spark-master:7077") \
     .config("spark.sql.streaming.checkpointLocation", f"/tmp/checkpoint_{SESSION_ID}") \
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
     .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
     .config("spark.sql.adaptive.enabled", "true") \
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
     .config("spark.streaming.stopGracefullyOnShutdown", "true") \
+    .config("spark.driver.host", "stream_consumer") \
+    .config("spark.driver.port", "7001") \
     .getOrCreate()
 
 quiet_logs(spark)
