@@ -36,7 +36,7 @@ def cleanup_checkpoints():
                 shutil.rmtree(dir_path)
                 print(f"🧹 Cleaned checkpoint: {dir_path}")
         except Exception as e:
-            print(f"⚠️ Could not clean {dir_path}: {e}")
+            print(f" Could not clean {dir_path}: {e}")
 
 # Clean up before starting
 print("🧹 Cleaning up old checkpoints...")
@@ -48,19 +48,68 @@ def quiet_logs(sc):
     logger.LogManager.getLogger("org").setLevel(logger.Level.ERROR)
     logger.LogManager.getLogger("akka").setLevel(logger.Level.ERROR)
 
-spark = SparkSession \
-    .builder \
-    .appName(f"ChicagoCrimesStreaming_{SESSION_ID}") \
-    .master("spark://spark-master:7077") \
-    .config("spark.sql.streaming.checkpointLocation", f"/tmp/checkpoint_{SESSION_ID}") \
-    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
-    .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
-    .config("spark.sql.adaptive.enabled", "true") \
-    .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-    .config("spark.streaming.stopGracefullyOnShutdown", "true") \
-    .config("spark.driver.host", "stream_consumer") \
-    .config("spark.driver.port", "7001") \
-    .getOrCreate()
+# Force cleanup of any existing Spark contexts
+import os
+os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0 pyspark-shell'
+
+print("\n" + "="*80)
+print(" SPARK SESSION INITIALIZATION")
+print("="*80)
+
+# Clean up any existing contexts
+try:
+    from pyspark import SparkContext
+    if SparkContext._active_spark_context:
+        print(" Cleaning up existing SparkContext...")
+        SparkContext._active_spark_context.stop()
+        SparkContext._active_spark_context = None
+        time.sleep(2)
+except:
+    pass
+
+print("\n Creating Spark session in LOCAL mode...")
+print("   Master: local[4]")
+print("    Note: Using local mode for maximum reliability")
+
+# Define all required Kafka JARs
+kafka_jars = [
+    "/opt/spark/jars/spark-sql-kafka-0-10_2.12-3.4.0.jar",
+    "/opt/spark/jars/kafka-clients-3.4.0.jar",
+    "/opt/spark/jars/spark-token-provider-kafka-0-10_2.12-3.4.0.jar",
+    "/opt/spark/jars/commons-pool2-2.11.1.jar"
+]
+jars_path = ",".join(kafka_jars)
+print(f"    Loading Kafka JARs: {len(kafka_jars)} files")
+
+try:
+    spark = SparkSession \
+        .builder \
+        .appName(f"ChicagoCrimesStreaming_{SESSION_ID}") \
+        .master("local[4]") \
+        .config("spark.jars", jars_path) \
+        .config("spark.sql.streaming.checkpointLocation", f"/tmp/checkpoint_{SESSION_ID}") \
+        .config("spark.driver.host", "localhost") \
+        .config("spark.driver.bindAddress", "localhost") \
+        .config("spark.ui.enabled", "false") \
+        .config("spark.sql.execution.arrow.pyspark.enabled", "false") \
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+        .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
+        .getOrCreate()
+    
+    # Test the session
+    print("    Testing Spark session...")
+    test_df = spark.createDataFrame([("test",)], ["value"])
+    count3 = test_df.count()
+    print(f"    Test successful! DataFrame count: {count3}")
+    print(f" Spark session created successfully!")
+    print(f"   App ID: {spark.sparkContext.applicationId}")
+    print(f"   Master: {spark.sparkContext.master}")
+    
+except Exception as e:
+    print(f" Failed to create Spark session: {e}")
+    exit(1)
+
+print("="*80 + "\n")
 
 quiet_logs(spark)
 
@@ -118,7 +167,7 @@ def write_to_mongodb_batch(df, collection_name):
 def write_to_mongodb_streaming(df, collection_name, checkpoint_location):
     """Write streaming DataFrame to MongoDB using foreachBatch"""
     def write_batch(batch_df, batch_id):
-        print(f"📝 Writing batch {batch_id} to {collection_name} ({batch_df.count()} records)")
+        print(f" Writing batch {batch_id} to {collection_name} ({batch_df.count()} records)")
         if batch_df.count() > 0:
             write_to_mongodb_batch(batch_df, collection_name)
     
@@ -136,59 +185,81 @@ def parse_json_safe(s):
     except:
         return {}  # prazna mapa za loše JSON-e
 
-parse_udf = udf(lambda s: parse_json_safe(s), MapType(StringType(), StringType()))
+# Create UDF with error handling
+print(" Creating JSON parsing UDF...")
+try:
+    parse_udf = udf(lambda s: parse_json_safe(s), MapType(StringType(), StringType()))
+    print(" JSON UDF created successfully!")
+except Exception as e:
+    print(f" Failed to create UDF: {e}")
+    exit(1)
 
 # -----------------------------
-# Čitanje iz Kafka sa timestamp informacijama .option("kafka.enable.auto.commit", "true") \
-df_stream = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", "kafka1:19092,kafka2:29092") \
-    .option("subscribe", TOPIC) \
-    .option("startingOffsets", "latest") \
-    .option("failOnDataLoss", "false") \
-    .option("startingOffsets", "earliest") \
-    .option("includeHeaders", "true") \
-    .option("kafka.request.timeout.ms", "120000") \
-    .option("kafka.session.timeout.ms", "60000") \
-    .option("kafka.max.poll.interval.ms", "300000") \
-    .option("kafka.fetch.max.wait.ms", "10000") \
-    .option("kafka.connections.max.idle.ms", "540000") \
-    .option("kafka.metadata.max.age.ms", "30000") \
-    .load()
+# Čitanje iz Kafka sa timestamp informacijama
+print(" Setting up Kafka stream connection...")
+try:
+    df_stream = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", "kafka1:19092,kafka2:29092") \
+        .option("subscribe", TOPIC) \
+        .option("startingOffsets", "latest") \
+        .option("failOnDataLoss", "false") \
+        .option("includeHeaders", "true") \
+        .option("kafka.request.timeout.ms", "120000") \
+        .option("kafka.session.timeout.ms", "60000") \
+        .option("kafka.max.poll.interval.ms", "300000") \
+        .option("kafka.fetch.max.wait.ms", "10000") \
+        .option("kafka.connections.max.idle.ms", "540000") \
+        .option("kafka.metadata.max.age.ms", "30000") \
+        .load()
+    
+    print(" Kafka stream connection configured successfully!")
+    
+except Exception as e:
+    print(f" Failed to configure Kafka stream: {e}")
+    exit(1)
 
 # Parsiranje JSON sa timestamp informacijama
-df_parsed = df_stream.selectExpr("CAST(value AS STRING)", "timestamp") \
-    .withColumn("parsed", parse_udf(col("value"))) \
-    .filter(col("parsed")["ID"].isNotNull()) \
-    .withColumn("event_time", col("timestamp")) \
-    .withWatermark("event_time", "10 seconds")
+print(" Setting up JSON parsing and data extraction...")
+try:
+    df_parsed = df_stream.selectExpr("CAST(value AS STRING)", "timestamp") \
+        .withColumn("parsed", parse_udf(col("value"))) \
+        .filter(col("parsed")["ID"].isNotNull()) \
+        .withColumn("event_time", col("timestamp")) \
+        .withWatermark("event_time", "10 seconds")
 
-# Ekstrakt polja iz mape sa dodatnim tipovima podataka
-def extract(colname):
-    return col("parsed")[colname]
+    # Ekstrakt polja iz mape sa dodatnim tipovima podataka
+    def extract(colname):
+        return col("parsed")[colname]
 
-df_crimes_enriched = df_parsed.select(
-    extract("ID").cast(IntegerType()).alias("crime_id"),
-    extract("Case Number").alias("case_number"),
-    to_timestamp(extract("Date"), "MM/dd/yyyy hh:mm:ss a").alias("crime_date"),
-    extract("Primary Type").alias("primary_type"),
-    extract("Description").alias("description"),
-    extract("Location Description").alias("location_description"),
-    extract("Arrest").cast(BooleanType()).alias("arrest"),
-    extract("Domestic").cast(BooleanType()).alias("domestic"),
-    extract("Latitude").cast(DoubleType()).alias("latitude"),
-    extract("Longitude").cast(DoubleType()).alias("longitude"),
-    col("event_time")
-).filter(col("crime_id").isNotNull() & col("crime_date").isNotNull())
+    df_crimes_enriched = df_parsed.select(
+        extract("ID").cast(IntegerType()).alias("crime_id"),
+        extract("Case Number").alias("case_number"),
+        to_timestamp(extract("Date"), "MM/dd/yyyy hh:mm:ss a").alias("crime_date"),
+        extract("Primary Type").alias("primary_type"),
+        extract("Description").alias("description"),
+        extract("Location Description").alias("location_description"),
+        extract("Arrest").cast(BooleanType()).alias("arrest"),
+        extract("Domestic").cast(BooleanType()).alias("domestic"),
+        extract("Latitude").cast(DoubleType()).alias("latitude"),
+        extract("Longitude").cast(DoubleType()).alias("longitude"),
+        col("event_time")
+    ).filter(col("crime_id").isNotNull() & col("crime_date").isNotNull())
 
-# Dodaj dodatne kolone za analizu
-df_crimes_enriched = df_crimes_enriched \
-    .withColumn("hour_of_day", hour("crime_date")) \
-    .withColumn("day_of_week", date_format("crime_date", "EEEE")) \
-    .withColumn("month", month("crime_date")) \
-    .withColumn("year", year("crime_date")) \
-    .withColumn("is_violent", when(col("primary_type").isin("HOMICIDE", "ASSAULT", "BATTERY", "ROBBERY"), True).otherwise(False)) \
-    .withColumn("is_weekend", when(col("day_of_week").isin("Saturday", "Sunday"), True).otherwise(False))
+    # Dodaj dodatne kolone za analizu
+    df_crimes_enriched = df_crimes_enriched \
+        .withColumn("hour_of_day", hour("crime_date")) \
+        .withColumn("day_of_week", date_format("crime_date", "EEEE")) \
+        .withColumn("month", month("crime_date")) \
+        .withColumn("year", year("crime_date")) \
+        .withColumn("is_violent", when(col("primary_type").isin("HOMICIDE", "ASSAULT", "BATTERY", "ROBBERY"), True).otherwise(False)) \
+        .withColumn("is_weekend", when(col("day_of_week").isin("Saturday", "Sunday"), True).otherwise(False))
+
+    print(" Data parsing and enrichment configured successfully!")
+    
+except Exception as e:
+    print(f" Failed to configure data parsing: {e}")
+    exit(1)
 
 print("Starting Advanced Stream Processing with 5 Complex Transformations...")
 print("=" * 80)
@@ -408,7 +479,7 @@ domestic_correlation = domestic_crimes_with_zone \
 # TRANSFORMATION 5: ADVANCED TEMPORAL PATTERN ANALYSIS WITH SLIDING WINDOWS
 # ===============================================================================================================
 
-print("\n⏰ TRANSFORMATION 5: Advanced Temporal Pattern Analysis")
+print("\n TRANSFORMATION 5: Advanced Temporal Pattern Analysis")
 
 temporal_patterns = df_crimes_enriched \
     .groupBy(
@@ -453,7 +524,7 @@ temporal_patterns = df_crimes_enriched \
 # OPTIMIZED OUTPUT STREAMS - SEQUENTIAL STARTUP TO PREVENT OVERLOAD
 # ===============================================================================================================
 
-print("\n💾 Starting streaming queries with optimized resource management...")
+print("\n Starting streaming queries with optimized resource management...")
 print(f"🔧 Session ID: {SESSION_ID}")
 
 # Start queries with delays to prevent conflicts
@@ -477,7 +548,7 @@ console_query1 = crime_hotspots.writeStream \
 print(" Crime Hotspots stream started successfully!")
 time.sleep(2)
 
-print("\n⚡ Starting Violence Escalation Detection...")
+print("\n Starting Violence Escalation Detection...")
 query3 = write_to_mongodb_streaming(
     violence_escalation,
     "stream_violence_escalation",
@@ -486,7 +557,7 @@ query3 = write_to_mongodb_streaming(
 time.sleep(3)  # Prevent conflicts
 print(" Violence Escalation stream started successfully!")
 
-print("\n🏠 Starting Domestic Violence Correlation...")
+print("\n Starting Domestic Violence Correlation...")
 query4 = write_to_mongodb_streaming(
     domestic_correlation,
     "stream_domestic_correlation", 

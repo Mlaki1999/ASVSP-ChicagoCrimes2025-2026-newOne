@@ -93,10 +93,8 @@ services:
     volumes:
       - ./consumer:/opt/consumer
     environment:
-      # SPARK_MASTER_URL: spark://spark-master:7077
-      SPARK_DRIVER_HOST: stream_consumer
-      SPARK_DRIVER_PORT: 7001
-      SPARK_UI_PORT: 4041
+      SPARK_MASTER_URL: spark://spark-master:7077
+      PYTHONUNBUFFERED: 1
     depends_on:
       - kafka1
       - kafka2
@@ -104,6 +102,17 @@ services:
       - producer
     networks:
       - big_data_network
+    restart: on-failure:3
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "consumer.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
