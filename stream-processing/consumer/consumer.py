@@ -228,19 +228,30 @@ try:
         .withColumn("event_time", col("timestamp")) \
         .withWatermark("event_time", "10 seconds")
 
-    # Ekstrakt polja iz mape sa dodatnim tipovima podataka
+    # Extract fields from parsed map with proper type conversions
     def extract(colname):
         return col("parsed")[colname]
+
+    # Parse date with fallback for different formats
+    # API format: 2024-12-31T23:58:00.000 (with milliseconds)
+    # Some may be: 2024-12-31T23:58:00 (without milliseconds)
+    date_col = when(
+        extract("Date").contains("."),
+        to_timestamp(extract("Date"), "yyyy-MM-dd'T'HH:mm:ss.SSS")
+    ).otherwise(
+        to_timestamp(extract("Date"), "yyyy-MM-dd'T'HH:mm:ss")
+    )
 
     df_crimes_enriched = df_parsed.select(
         extract("ID").cast(IntegerType()).alias("crime_id"),
         extract("Case Number").alias("case_number"),
-        to_timestamp(extract("Date"), "MM/dd/yyyy hh:mm:ss a").alias("crime_date"),
+        date_col.alias("crime_date"),
         extract("Primary Type").alias("primary_type"),
         extract("Description").alias("description"),
         extract("Location Description").alias("location_description"),
-        extract("Arrest").cast(BooleanType()).alias("arrest"),
-        extract("Domestic").cast(BooleanType()).alias("domestic"),
+        # Handle string "true"/"false" from API
+        when(lower(extract("Arrest")) == "true", True).otherwise(False).alias("arrest"),
+        when(lower(extract("Domestic")) == "true", True).otherwise(False).alias("domestic"),
         extract("Latitude").cast(DoubleType()).alias("latitude"),
         extract("Longitude").cast(DoubleType()).alias("longitude"),
         col("event_time")
