@@ -1,3 +1,7 @@
+#!/bin/bash
+# Get script directory for absolute paths
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
 echo "Complete Streaming Setup Fix"
 echo "==============================="
 
@@ -10,18 +14,66 @@ echo "Cleanup complete"
 
 echo ""
 echo "Step 2: Ensure batch processing is running..."
-cd setup
 if ! docker ps | grep -q "spark-master"; then
     echo "Starting batch processing cluster..."
-    ./cluster_up.sh
-    sleep 30
+    
+    # Create network if not exists
+    docker network create big_data_network 2>/dev/null || echo "Network already exists"
+    sleep 2
+    
+    # Start batch processing containers
+    cd "$SCRIPT_DIR/batch_processing"
+    docker-compose up -d
+    sleep 5
+    
+    # Check if data file exists and copy it
+    DATA_FILE="$SCRIPT_DIR/data/chicago_crimes.csv"
+    if [ -f "$DATA_FILE" ]; then
+        echo "Copying data to namenode..."
+        MSYS_NO_PATHCONV=1 docker cp "$DATA_FILE" namenode:/batch_data.csv
+        sleep 2
+    fi
+    
+    # Wait for HDFS to leave safe mode
+    echo "Waiting for HDFS to be ready..."
+    MAX_RETRIES=30
+    RETRIES=0
+    while [ $RETRIES -lt $MAX_RETRIES ]; do
+        if ! docker exec namenode hdfs dfsadmin -safemode get 2>/dev/null | grep -q "Safe mode is ON"; then
+            echo "HDFS ready"
+            break
+        fi
+        echo "Waiting for HDFS... ($RETRIES/$MAX_RETRIES)"
+        sleep 10
+        RETRIES=$((RETRIES + 1))
+    done
+    
+    # Create HDFS directories and upload data if data file exists
+    if [ -f "$DATA_FILE" ]; then
+        echo "Uploading data to HDFS..."
+        MSYS_NO_PATHCONV=1 docker exec namenode hdfs dfs -mkdir -p /user/root/data-lake/raw
+        MSYS_NO_PATHCONV=1 docker exec namenode hdfs dfs -mkdir -p /user/root/data-lake/transform
+        MSYS_NO_PATHCONV=1 docker exec namenode hdfs dfs -copyFromLocal -f /batch_data.csv /user/root/data-lake/raw/batch_data.csv
+        sleep 2
+    fi
+    
+    # Copy PostgreSQL JAR
+    JAR_FILE="$SCRIPT_DIR/data/postgresql-42.7.0.jar"
+    if [ -f "$JAR_FILE" ]; then
+        echo "Copying PostgreSQL JAR..."
+        MSYS_NO_PATHCONV=1 docker cp "$JAR_FILE" spark-master:/opt/bitnami/spark/jars/postgresql-42.7.0.jar 2>/dev/null || true
+        MSYS_NO_PATHCONV=1 docker cp "$JAR_FILE" spark-master:./postgresql-42.7.0.jar 2>/dev/null || true
+    fi
+    
+    echo "Batch processing cluster started"
+    sleep 10
 else
     echo "Batch processing already running"
 fi
 
 echo ""
 echo "Step 3: Start fresh streaming cluster..."
-cd ../stream-processing
+cd "$SCRIPT_DIR/stream-processing"
 docker-compose up -d
 
 echo ""
@@ -238,12 +290,12 @@ if [ "$CONNECTIVITY_OK" = true ]; then
     echo "  • Mongo Express: http://localhost:8083 (admin/admin123)" 
     echo "  • MongoDB:      mongodb://root:mongodb123@localhost:27018/chicago_crimes"
     echo ""
-    echo "🔍 To monitor:"
+    echo "To monitor:"
     echo "  docker logs kafka_producer -f      # Producer logs"
     echo "  docker logs stream_consumer -f     # Consumer logs"
     echo "  docker logs mongodb -f             # MongoDB logs"
     echo ""
-    echo "💾 Data will be stored in MongoDB collections:"
+    echo "Data will be stored in MongoDB collections:"
     echo "  • stream_crime_hotspots"
     echo "  • stream_pattern_analysis" 
     echo "  • stream_violence_escalation"

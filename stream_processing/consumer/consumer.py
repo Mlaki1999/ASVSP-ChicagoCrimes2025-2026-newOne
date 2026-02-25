@@ -3,6 +3,9 @@ import time
 import uuid
 import shutil
 import os
+import sys
+import logging
+import warnings
 import pandas as pd
 from datetime import datetime
 from pyspark.sql import SparkSession
@@ -10,6 +13,30 @@ from pyspark.sql.functions import *
 from pyspark.sql.types import *
 from pyspark.sql.window import Window
 from pymongo import MongoClient
+
+# Suppress Python warnings
+warnings.filterwarnings('ignore')
+logging.basicConfig(level=logging.ERROR)
+logging.getLogger('py4j').setLevel(logging.ERROR)
+
+# Suppress Spark console progress bars
+# os.environ['SPARK_SUBMIT_OPTS'] = '--conf spark.ui.showConsoleProgress=false'
+
+# Custom stderr filter to block Stage progress lines
+class StageProgressFilter:
+    def __init__(self, original_stderr):
+        self.original_stderr = original_stderr
+        
+    def write(self, message):
+        # Block Stage progress lines and empty lines with just carriage returns
+        if 'Stage ' not in message and message.strip() and not message.startswith('\r'):
+            self.original_stderr.write(message)
+    
+    def flush(self):
+        self.original_stderr.flush()
+
+# Apply the filter
+sys.stderr = StageProgressFilter(sys.stderr)
 
 TOPIC = "chicagocrimes"
 
@@ -36,7 +63,7 @@ def cleanup_checkpoints():
                 shutil.rmtree(dir_path)
                 print(f"🧹 Cleaned checkpoint: {dir_path}")
         except Exception as e:
-            print(f"⚠️ Could not clean {dir_path}: {e}")
+            print(f" Could not clean {dir_path}: {e}")
 
 # Clean up before starting
 print("🧹 Cleaning up old checkpoints...")
@@ -44,23 +71,114 @@ cleanup_checkpoints()
 time.sleep(2)
 
 def quiet_logs(sc):
+    """Aggressively suppress ALL Spark and Kafka warnings for clean output"""
     logger = sc._jvm.org.apache.log4j
-    logger.LogManager.getLogger("org").setLevel(logger.Level.ERROR)
-    logger.LogManager.getLogger("akka").setLevel(logger.Level.ERROR)
+    
+    # Set root logger to FATAL (only critical errors)
+    logger.LogManager.getRootLogger().setLevel(logger.Level.FATAL)
+    
+    # Suppress all major loggers
+    for log_name in [
+        "org", "akka", "org.apache.kafka", "kafka",
+        "org.apache.spark", "org.spark_project", 
+        "org.apache.hadoop", "org.apache.parquet",
+        "org.apache.spark.sql.kafka010",
+        "org.apache.spark.sql.kafka010.KafkaDataConsumer",
+        "org.apache.kafka.clients",
+        "org.apache.kafka.clients.consumer",
+        "org.apache.kafka.clients.admin",
+        "org.apache.spark.scheduler",
+        "org.apache.spark.executor",
+        "org.apache.spark.sql.execution.streaming",
+        "org.apache.spark.sql.execution.streaming.MicroBatchExecution",
+        "org.apache.spark.sql.execution.streaming.ProcessingTimeExecutor"
+    ]:
+        logger.LogManager.getLogger(log_name).setLevel(logger.Level.FATAL)
+    
+    print("✓ Logging configured: ULTRA QUIET MODE (fatal errors only)")
 
-spark = SparkSession \
-    .builder \
-    .appName(f"ChicagoCrimesStreaming_{SESSION_ID}") \
-    .master("spark://spark-master:7077") \
-    .config("spark.sql.streaming.checkpointLocation", f"/tmp/checkpoint_{SESSION_ID}") \
-    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
-    .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
-    .config("spark.sql.adaptive.enabled", "true") \
-    .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-    .config("spark.streaming.stopGracefullyOnShutdown", "true") \
-    .config("spark.driver.host", "stream_consumer") \
-    .config("spark.driver.port", "7001") \
-    .getOrCreate()
+# Force cleanup of any existing Spark contexts
+import os
+os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0 pyspark-shell'
+
+print("\n" + "="*80)
+print(" SPARK SESSION INITIALIZATION")
+print("="*80)
+
+# Clean up any existing contexts
+try:
+    from pyspark import SparkContext
+    if SparkContext._active_spark_context:
+        print(" Cleaning up existing SparkContext...")
+        SparkContext._active_spark_context.stop()
+        SparkContext._active_spark_context = None
+        time.sleep(2)
+except:
+    pass
+
+print("\n Creating Spark session in LOCAL mode...")
+print("   Master: local[2] (reduced for Docker memory constraints)")
+print("   Driver Memory: 1g")
+print("   Executor Memory: 1g")
+print("    Note: Using local mode with memory optimization for Docker")
+
+# Define all required Kafka JARs
+kafka_jars = [
+    "/opt/spark/jars/spark-sql-kafka-0-10_2.12-3.4.0.jar",
+    "/opt/spark/jars/kafka-clients-3.4.0.jar",
+    "/opt/spark/jars/spark-token-provider-kafka-0-10_2.12-3.4.0.jar",
+    "/opt/spark/jars/commons-pool2-2.11.1.jar"
+]
+jars_path = ",".join(kafka_jars)
+print(f"    Loading Kafka JARs: {len(kafka_jars)} files")
+
+try:
+    spark = SparkSession \
+        .builder \
+        .appName(f"ChicagoCrimesStreaming_{SESSION_ID}") \
+        .master("local[2]") \
+        .config("spark.jars", jars_path) \
+        .config("spark.driver.memory", "1g") \
+        .config("spark.executor.memory", "1g") \
+        .config("spark.driver.maxResultSize", "512m") \
+        .config("spark.memory.fraction", "0.6") \
+        .config("spark.memory.storageFraction", "0.5") \
+        .config("spark.sql.streaming.checkpointLocation", f"/tmp/checkpoint_{SESSION_ID}") \
+        .config("spark.driver.host", "localhost") \
+        .config("spark.driver.bindAddress", "localhost") \
+        .config("spark.ui.enabled", "false") \
+        .config("spark.sql.execution.arrow.pyspark.enabled", "false") \
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+        .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
+        .config("spark.driver.extraJavaOptions", "-Dlog4j.configuration=file:/tmp/log4j.properties -XX:+UseG1GC -XX:+UnlockExperimentalVMOptions -XX:InitiatingHeapOccupancyPercent=35") \
+        .config("spark.executor.extraJavaOptions", "-Dlog4j.configuration=file:/tmp/log4j.properties -XX:+UseG1GC") \
+        .config("spark.ui.showConsoleProgress", "false") \
+        .config("spark.ui.dagScheduler.showConsoleProgress", "false") \
+        .getOrCreate()
+    
+    # Also set SparkContext configuration to suppress console progress
+    spark.sparkContext.setLogLevel("FATAL")
+    
+    # Test the session (suppress output)
+    print("    Testing Spark session...")
+    import sys
+    from io import StringIO
+    old_stdout = sys.stdout
+    sys.stdout = StringIO()  # Suppress test output
+    test_df = spark.createDataFrame([("test",)], ["value"])
+    count3 = test_df.count()
+    sys.stdout = old_stdout  # Restore stdout
+    
+    print(f"    Test successful! DataFrame count: {count3}")
+    print(f" Spark session created successfully!")
+    print(f"   App ID: {spark.sparkContext.applicationId}")
+    print(f"   Master: {spark.sparkContext.master}")
+    
+except Exception as e:
+    print(f" Failed to create Spark session: {e}")
+    exit(1)
+
+print("="*80 + "\n")
 
 quiet_logs(spark)
 
@@ -79,10 +197,10 @@ while not mongo_client:
         mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
         # Test connection
         mongo_client.server_info()
-        print("✅ Connected to MongoDB!")
+        print(" Connected to MongoDB!")
         break
     except Exception as e:
-        print(f"⚠️ Connecting to MongoDB: {e}... retrying in 3s")
+        print(f" Connecting to MongoDB: {e}... retrying in 3s")
         time.sleep(3)
 
 db = mongo_client[MONGODB_DATABASE]
@@ -111,21 +229,94 @@ def write_to_mongodb_batch(df, collection_name):
             # Insert into MongoDB
             collection = db[collection_name]
             result = collection.insert_many(records)
-            print(f"✓ Successfully saved {len(result.inserted_ids)} records to {collection_name}")
+            return len(result.inserted_ids)
+        return 0
     except Exception as e:
         print(f"✗ Error saving to {collection_name}: {str(e)}")
+        return 0
 
-def write_to_mongodb_streaming(df, collection_name, checkpoint_location):
-    """Write streaming DataFrame to MongoDB using foreachBatch"""
+def create_visual_batch_writer(collection_name, query_name, emoji, trigger_interval):
+    """Create a foreachBatch function with clean visual output"""
     def write_batch(batch_df, batch_id):
-        print(f"📝 Writing batch {batch_id} to {collection_name} ({batch_df.count()} records)")
-        if batch_df.count() > 0:
-            write_to_mongodb_batch(batch_df, collection_name)
+        # Redirect stdout temporarily to suppress Spark progress
+        import sys
+        from io import StringIO
+        
+        record_count = batch_df.count()
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        # Use plural/singular correctly
+        record_word = "record" if record_count == 1 else "records"
+        
+        print("\n" + "="*80)
+        print(f"{emoji} {query_name} - Batch #{batch_id} [{timestamp}]")
+        print(f"   Trigger Interval: {trigger_interval}")
+        print("="*80)
+        
+        if record_count > 0:
+            print(f"📊 Processing {record_count} {record_word}...")
+            
+            # Collect sample for clean display (avoid .show() which triggers warnings)
+            try:
+                # Capture Spark output during limit/collect
+                old_stdout = sys.stdout
+                sys.stdout = StringIO()
+                
+                sample_records = batch_df.limit(3).collect()
+                
+                # Restore stdout
+                sys.stdout = old_stdout
+                
+                # Calculate sample size (avoid PySpark's min function)
+                num_samples = len(sample_records)
+                if num_samples > 3:
+                    num_samples = 3
+                
+                print(f"\n📋 Sample Records (showing {num_samples} of {record_count}):")
+                print("-" * 80)
+                for i, record in enumerate(sample_records[:3], 1):  # Only take first 3
+                    print(f"\n   Record {i}:")
+                    # Show key fields based on schema
+                    record_dict = record.asDict()
+                    field_count = 0
+                    for key, value in record_dict.items():
+                        if field_count >= 6:  # Show first 6 fields
+                            break
+                        if value is not None:
+                            # Format value based on type
+                            if isinstance(value, datetime):
+                                value_str = value.strftime("%Y-%m-%d %H:%M:%S")
+                            elif isinstance(value, float):
+                                value_str = f"{value:.4f}"
+                            elif isinstance(value, list):
+                                value_str = f"[{len(value)} items]"
+                            else:
+                                value_str = str(value)[:50]  # Truncate long strings
+                            print(f"      {key}: {value_str}")
+                            field_count += 1
+                print("-" * 80)
+            except Exception as e:
+                print(f"   ⚠️  Could not display sample: {str(e)[:60]}")
+            
+            # Save to MongoDB
+            saved_count = write_to_mongodb_batch(batch_df, collection_name)
+            saved_word = "record" if saved_count == 1 else "records"
+            print(f"\n✅ Successfully saved {saved_count} {saved_word} to: {collection_name}")
+        else:
+            print(f"⏳ No new records in this batch (waiting for streaming data...)")
+        
+        print("="*80 + "\n")
+    
+    return write_batch
+
+def write_to_mongodb_streaming(df, collection_name, checkpoint_location, query_name, emoji, trigger_interval):
+    """Write streaming DataFrame to MongoDB with visual feedback"""
+    batch_writer = create_visual_batch_writer(collection_name, query_name, emoji, trigger_interval)
     
     return df.writeStream \
-        .foreachBatch(write_batch) \
+        .foreachBatch(batch_writer) \
         .option("checkpointLocation", checkpoint_location) \
-        .trigger(processingTime='30 seconds') \
+        .trigger(processingTime=trigger_interval) \
         .start()
 
 # -----------------------------
@@ -136,59 +327,92 @@ def parse_json_safe(s):
     except:
         return {}  # prazna mapa za loše JSON-e
 
-parse_udf = udf(lambda s: parse_json_safe(s), MapType(StringType(), StringType()))
+# Create UDF with error handling
+print(" Creating JSON parsing UDF...")
+try:
+    parse_udf = udf(lambda s: parse_json_safe(s), MapType(StringType(), StringType()))
+    print(" JSON UDF created successfully!")
+except Exception as e:
+    print(f" Failed to create UDF: {e}")
+    exit(1)
 
 # -----------------------------
-# Čitanje iz Kafka sa timestamp informacijama .option("kafka.enable.auto.commit", "true") \
-df_stream = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", "kafka1:19092,kafka2:19092") \
-    .option("subscribe", TOPIC) \
-    .option("startingOffsets", "latest") \
-    .option("failOnDataLoss", "false") \
-    .option("startingOffsets", "earliest") \
-    .option("includeHeaders", "true") \
-    .option("kafka.request.timeout.ms", "120000") \
-    .option("kafka.session.timeout.ms", "60000") \
-    .option("kafka.max.poll.interval.ms", "300000") \
-    .option("kafka.fetch.max.wait.ms", "10000") \
-    .option("kafka.connections.max.idle.ms", "540000") \
-    .option("kafka.metadata.max.age.ms", "30000") \
-    .load()
+# Čitanje iz Kafka sa timestamp informacijama
+print(" Setting up Kafka stream connection...")
+try:
+    df_stream = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", "kafka1:19092,kafka2:29092") \
+        .option("subscribe", TOPIC) \
+        .option("startingOffsets", "latest") \
+        .option("failOnDataLoss", "false") \
+        .option("includeHeaders", "true") \
+        .option("kafka.request.timeout.ms", "120000") \
+        .option("kafka.session.timeout.ms", "60000") \
+        .option("kafka.max.poll.interval.ms", "300000") \
+        .option("kafka.fetch.max.wait.ms", "10000") \
+        .option("kafka.connections.max.idle.ms", "540000") \
+        .option("kafka.metadata.max.age.ms", "30000") \
+        .load()
+    
+    print(" Kafka stream connection configured successfully!")
+    
+except Exception as e:
+    print(f" Failed to configure Kafka stream: {e}")
+    exit(1)
 
 # Parsiranje JSON sa timestamp informacijama
-df_parsed = df_stream.selectExpr("CAST(value AS STRING)", "timestamp") \
-    .withColumn("parsed", parse_udf(col("value"))) \
-    .filter(col("parsed")["ID"].isNotNull()) \
-    .withColumn("event_time", col("timestamp")) \
-    .withWatermark("event_time", "10 seconds")
+print(" Setting up JSON parsing and data extraction...")
+try:
+    df_parsed = df_stream.selectExpr("CAST(value AS STRING)", "timestamp") \
+        .withColumn("parsed", parse_udf(col("value"))) \
+        .filter(col("parsed")["ID"].isNotNull()) \
+        .withColumn("event_time", col("timestamp")) \
+        .withWatermark("event_time", "10 seconds")
 
-# Ekstrakt polja iz mape sa dodatnim tipovima podataka
-def extract(colname):
-    return col("parsed")[colname]
+    # Extract fields from parsed map with proper type conversions
+    def extract(colname):
+        return col("parsed")[colname]
 
-df_crimes_enriched = df_parsed.select(
-    extract("ID").cast(IntegerType()).alias("crime_id"),
-    extract("Case Number").alias("case_number"),
-    to_timestamp(extract("Date"), "MM/dd/yyyy hh:mm:ss a").alias("crime_date"),
-    extract("Primary Type").alias("primary_type"),
-    extract("Description").alias("description"),
-    extract("Location Description").alias("location_description"),
-    extract("Arrest").cast(BooleanType()).alias("arrest"),
-    extract("Domestic").cast(BooleanType()).alias("domestic"),
-    extract("Latitude").cast(DoubleType()).alias("latitude"),
-    extract("Longitude").cast(DoubleType()).alias("longitude"),
-    col("event_time")
-).filter(col("crime_id").isNotNull() & col("crime_date").isNotNull())
+    # Parse date with fallback for different formats
+    # API format: 2024-12-31T23:58:00.000 (with milliseconds)
+    # Some may be: 2024-12-31T23:58:00 (without milliseconds)
+    date_col = when(
+        extract("Date").contains("."),
+        to_timestamp(extract("Date"), "yyyy-MM-dd'T'HH:mm:ss.SSS")
+    ).otherwise(
+        to_timestamp(extract("Date"), "yyyy-MM-dd'T'HH:mm:ss")
+    )
 
-# Dodaj dodatne kolone za analizu
-df_crimes_enriched = df_crimes_enriched \
-    .withColumn("hour_of_day", hour("crime_date")) \
-    .withColumn("day_of_week", date_format("crime_date", "EEEE")) \
-    .withColumn("month", month("crime_date")) \
-    .withColumn("year", year("crime_date")) \
-    .withColumn("is_violent", when(col("primary_type").isin("HOMICIDE", "ASSAULT", "BATTERY", "ROBBERY"), True).otherwise(False)) \
-    .withColumn("is_weekend", when(col("day_of_week").isin("Saturday", "Sunday"), True).otherwise(False))
+    df_crimes_enriched = df_parsed.select(
+        extract("ID").cast(IntegerType()).alias("crime_id"),
+        extract("Case Number").alias("case_number"),
+        date_col.alias("crime_date"),
+        extract("Primary Type").alias("primary_type"),
+        extract("Description").alias("description"),
+        extract("Location Description").alias("location_description"),
+        # Handle string "true"/"false" from API
+        when(lower(extract("Arrest")) == "true", True).otherwise(False).alias("arrest"),
+        when(lower(extract("Domestic")) == "true", True).otherwise(False).alias("domestic"),
+        extract("Latitude").cast(DoubleType()).alias("latitude"),
+        extract("Longitude").cast(DoubleType()).alias("longitude"),
+        col("event_time")
+    ).filter(col("crime_id").isNotNull() & col("crime_date").isNotNull())
+
+    # Dodaj dodatne kolone za analizu
+    df_crimes_enriched = df_crimes_enriched \
+        .withColumn("hour_of_day", hour("crime_date")) \
+        .withColumn("day_of_week", date_format("crime_date", "EEEE")) \
+        .withColumn("month", month("crime_date")) \
+        .withColumn("year", year("crime_date")) \
+        .withColumn("is_violent", when(col("primary_type").isin("HOMICIDE", "ASSAULT", "BATTERY", "ROBBERY"), True).otherwise(False)) \
+        .withColumn("is_weekend", when(col("day_of_week").isin("Saturday", "Sunday"), True).otherwise(False))
+
+    print(" Data parsing and enrichment configured successfully!")
+    
+except Exception as e:
+    print(f" Failed to configure data parsing: {e}")
+    exit(1)
 
 print("Starting Advanced Stream Processing with 5 Complex Transformations...")
 print("=" * 80)
@@ -197,7 +421,7 @@ print("=" * 80)
 # TRANSFORMATION 1: REAL-TIME CRIME HOTSPOT DETECTION WITH WINDOWING
 # ===============================================================================================================
 
-print("\n🔥 TRANSFORMATION 1: Real-time Crime Hotspot Detection")
+print("\n TRANSFORMATION 1: Real-time Crime Hotspot Detection")
 crime_hotspots = df_crimes_enriched \
     .filter(col("latitude").isNotNull() & col("longitude").isNotNull()) \
     .withColumn("geo_grid", concat(
@@ -234,7 +458,7 @@ crime_hotspots = df_crimes_enriched \
 # TRANSFORMATION 2: STREAM-TO-BATCH JOIN - HISTORICAL CRIME PATTERN MATCHING
 # ===============================================================================================================
 
-print("\n📊 TRANSFORMATION 2: Stream-to-Batch Join - Historical Pattern Matching")
+print("\n TRANSFORMATION 2: Stream-to-Batch Join - Historical Pattern Matching")
 
 # Create batch reference data (this would typically come from your batch processing results)
 batch_crime_patterns = spark.sql("""
@@ -292,7 +516,7 @@ stream_pattern_analysis = df_crimes_enriched \
 # TRANSFORMATION 3: COMPLEX WINDOWED AGGREGATION - VIOLENCE ESCALATION DETECTION
 # ===============================================================================================================
 
-print("\n⚡ TRANSFORMATION 3: Violence Escalation Detection with Complex Windowing")
+print("\n TRANSFORMATION 3: Violence Escalation Detection with Complex Windowing")
 
 violence_escalation = df_crimes_enriched \
     .filter(col("is_violent") == True) \
@@ -335,7 +559,7 @@ violence_escalation = df_crimes_enriched \
 # TRANSFORMATION 4: STREAM-TO-STREAM JOIN - DOMESTIC VIOLENCE CORRELATION ANALYSIS
 # ===============================================================================================================
 
-print("\n🏠 TRANSFORMATION 4: Stream-to-Stream Join - Domestic Violence Correlation")
+print("\n TRANSFORMATION 4: Stream-to-Stream Join - Domestic Violence Correlation")
 
 # Create two streams from the same source for self-join
 domestic_crimes = df_crimes_enriched \
@@ -408,7 +632,7 @@ domestic_correlation = domestic_crimes_with_zone \
 # TRANSFORMATION 5: ADVANCED TEMPORAL PATTERN ANALYSIS WITH SLIDING WINDOWS
 # ===============================================================================================================
 
-print("\n⏰ TRANSFORMATION 5: Advanced Temporal Pattern Analysis")
+print("\n TRANSFORMATION 5: Advanced Temporal Pattern Analysis")
 
 temporal_patterns = df_crimes_enriched \
     .groupBy(
@@ -450,94 +674,122 @@ temporal_patterns = df_crimes_enriched \
     )
 
 # ===============================================================================================================
-# OPTIMIZED OUTPUT STREAMS - SEQUENTIAL STARTUP TO PREVENT OVERLOAD
+# OPTIMIZED OUTPUT STREAMS WITH STAGGERED TIMING AND VISUAL FEEDBACK
 # ===============================================================================================================
 
-print("\n💾 Starting streaming queries with optimized resource management...")
-print(f"🔧 Session ID: {SESSION_ID}")
+print("\n" + "#"*80)
+print("# STARTING STREAMING QUERIES WITH OPTIMIZED TIMING")
+print("#"*80)
+print(f"\n🔧 Session ID: {SESSION_ID}")
+print("\n📊 Optimized Query Timing (prevents 'falling behind' warnings):")
+print("   🔥 Hotspots:            Every 30 seconds (Fast - Critical real-time alerts)")
+print("   📈 Temporal Patterns:   Every 45 seconds (Medium - Trend analysis)")
+print("   🔍 Pattern Analysis:    Every 60 seconds (Standard - Anomaly detection)")
+print("   ⚠️  Violence Escalation: Every 90 seconds (Slower - Complex aggregations)")
+print("   🔗 Domestic Correlation: Every 120 seconds (SLOWEST - Stream-to-stream join)")
+print("\n" + "#"*80 + "\n")
 
-# Start queries with delays to prevent conflicts
-print("\n🔥 Starting Crime Hotspots (Most Critical)...")
+time.sleep(3)
+
+# QUERY 1: Crime Hotspots - 30 seconds (FASTEST)
+print("\n🔥 [1/5] Starting Crime Hotspots Detection...")
+print("    ⏱️  Trigger: Every 30 seconds")
 query1 = write_to_mongodb_streaming(
     crime_hotspots, 
     "stream_crime_hotspots",
-    f"/tmp/checkpoint_hotspots_{SESSION_ID}"
+    f"/tmp/checkpoint_hotspots_{SESSION_ID}",
+    "Crime Hotspot Detection",
+    "🔥",
+    "30 seconds"
 )
-time.sleep(3)  # Delay to prevent conflicts
-
-# Console output for immediate monitoring
-console_query1 = crime_hotspots.writeStream \
-    .outputMode("append") \
-    .format("console") \
-    .option("truncate", False) \
-    .option("checkpointLocation", f"/tmp/checkpoint_console_{SESSION_ID}") \
-    .trigger(processingTime='45 seconds') \
-    .start()
-
-print("✅ Crime Hotspots stream started successfully!")
+print("    ✅ Started successfully!")
 time.sleep(2)
 
-print("\n⚡ Starting Violence Escalation Detection...")
-query3 = write_to_mongodb_streaming(
-    violence_escalation,
-    "stream_violence_escalation",
-    f"/tmp/checkpoint_violence_{SESSION_ID}"
-)
-time.sleep(3)  # Prevent conflicts
-print("✅ Violence Escalation stream started successfully!")
-
-print("\n🏠 Starting Domestic Violence Correlation...")
-query4 = write_to_mongodb_streaming(
-    domestic_correlation,
-    "stream_domestic_correlation", 
-    f"/tmp/checkpoint_domestic_{SESSION_ID}"
-)
-time.sleep(3)  # Prevent conflicts
-print("✅ Domestic Correlation stream started successfully!")
-
-print("\n🧠 Starting Pattern Analysis...")  
-query2 = write_to_mongodb_streaming(
-    stream_pattern_analysis,
-    "stream_pattern_analysis", 
-    f"/tmp/checkpoint_patterns_{SESSION_ID}"
-)
-time.sleep(3)  # Prevent conflicts
-print("✅ Pattern Analysis stream started successfully!")
-
-print("\n⏰ Starting Temporal Patterns...")
+# QUERY 2: Temporal Patterns - 45 seconds
+print("\n📈 [2/5] Starting Temporal Pattern Analysis...")
+print("    ⏱️  Trigger: Every 45 seconds")
 query5 = write_to_mongodb_streaming(
     temporal_patterns,
     "stream_temporal_patterns",
-    f"/tmp/checkpoint_temporal_{SESSION_ID}"
+    f"/tmp/checkpoint_temporal_{SESSION_ID}",
+    "Temporal Pattern Analysis",
+    "📈",
+    "45 seconds"
 )
+print("    ✅ Started successfully!")
 time.sleep(2)
 
-print("✅ All streams started successfully!")
+# QUERY 3: Pattern Analysis - 60 seconds
+print("\n🔍 [3/5] Starting Historical Pattern Matching...")  
+print("    ⏱️  Trigger: Every 60 seconds")
+query2 = write_to_mongodb_streaming(
+    stream_pattern_analysis,
+    "stream_pattern_analysis", 
+    f"/tmp/checkpoint_patterns_{SESSION_ID}",
+    "Historical Pattern Matching",
+    "🔍",
+    "60 seconds"
+)
+print("    ✅ Started successfully!")
+time.sleep(2)
 
-print("\n🚀 All 5 Advanced Stream Processing Transformations are running!")
-print("📊 Data is being persisted to MongoDB collections:")
-print("   • stream_crime_hotspots - Real-time hotspot detection")
-print("   • stream_pattern_analysis - Historical pattern matching") 
-print("   • stream_violence_escalation - Violence escalation monitoring")
-print("   • stream_domestic_correlation - Domestic violence correlations")
-print("   • stream_temporal_patterns - Advanced temporal analysis")
-print("\n🔄 Monitoring console outputs...")
+# QUERY 4: Violence Escalation - 90 seconds
+print("\n⚠️  [4/5] Starting Violence Escalation Detection...")
+print("    ⏱️  Trigger: Every 90 seconds")
+query3 = write_to_mongodb_streaming(
+    violence_escalation,
+    "stream_violence_escalation",
+    f"/tmp/checkpoint_violence_{SESSION_ID}",
+    "Violence Escalation Monitoring",
+    "⚠️",
+    "90 seconds"
+)
+print("    ✅ Started successfully!")
+time.sleep(2)
+
+# QUERY 5: Domestic Correlation - 120 seconds (SLOWEST - complex join)
+print("\n🔗 [5/5] Starting Domestic Violence Correlation...")
+print("    ⏱️  Trigger: Every 120 seconds (Complex stream-to-stream join)")
+query4 = write_to_mongodb_streaming(
+    domestic_correlation,
+    "stream_domestic_correlation", 
+    f"/tmp/checkpoint_domestic_{SESSION_ID}",
+    "Domestic Violence Correlation",
+    "🔗",
+    "120 seconds"
+)
+print("    ✅ Started successfully!")
+
+print("\n" + "#"*80)
+print("# ALL 5 STREAMING QUERIES RUNNING!")
+print("#"*80)
+
+print("\n📦 MongoDB Collections:")
+print("   • stream_crime_hotspots - Real-time hotspot detection (30s)")
+print("   • stream_temporal_patterns - Advanced temporal analysis (45s)")
+print("   • stream_pattern_analysis - Historical pattern matching (60s)")
+print("   • stream_violence_escalation - Violence escalation monitoring (90s)")
+print("   • stream_domestic_correlation - Domestic violence correlations (120s)")
+print("\n🎯 Watch below for real-time processing updates...")
+print("   (Different queries will trigger at staggered intervals)")
+print("   All warnings suppressed - showing only actual processing events!")
+print("\n" + "#"*80 + "\n")
 
 # Graceful termination handling
 import signal
 import sys
 
 def signal_handler(sig, frame):
-    print('\n🛑 Gracefully stopping all streams...')
+    print('\n⏸️  Gracefully stopping all streams...')
     try:
         query1.stop()
         query2.stop()  
         query3.stop()
         query4.stop()
         query5.stop()
-        console_query1.stop()
-    except:
-        pass
+        print('✅ All streams stopped successfully!')
+    except Exception as e:
+        print(f'⚠️  Error stopping streams: {e}')
     sys.exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
